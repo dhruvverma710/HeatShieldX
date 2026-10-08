@@ -112,11 +112,26 @@ class TestVulnerability:
         assert (vuln['prov_source_type'] == 'synthetic').all()
 
     def test_canonical_normalisation(self):
-        """Canonical values span [0,1]; non-canonical values equal their canonical twin."""
+        """Canonical values span [0,1]; non-canonical values equal their canonical twin. With clipping disabled."""
         from src.vulnerability_engine import compute_vulnerability
+        from src.config_loader import get_config
+        
+        # Disable clipping for this test to match old behaviour
+        config = get_config()
+        if 'risk' not in config:
+            config['risk'] = {}
+        old_clip = config['risk'].get('normalization_clip_percentile')
+        config['risk']['normalization_clip_percentile'] = 100
+        
         segs = _make_segments()
         blds = _make_buildings()
         vuln = compute_vulnerability(segs, blds)
+
+        # Restore config
+        if old_clip is None:
+            del config['risk']['normalization_clip_percentile']
+        else:
+            config['risk']['normalization_clip_percentile'] = old_clip
 
         # Non-canonical rows should match their canonical twin
         for sid, grp in vuln.groupby('street_id'):
@@ -234,39 +249,101 @@ class TestRiskEngine:
             np.testing.assert_allclose(df['final_risk_raw'], expected_raw, atol=1e-9)
 
     def test_normalisation_bounds(self):
-        from src.risk_engine import normalize_risk
+        from src.risk_engine import normalize_score
         values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        normed, vmin, vmax = normalize_risk(values)
+        normed, vmin, vmax = normalize_score(values)
         assert normed.min() >= 0
         assert normed.max() <= 100
 
     def test_zero_variance(self):
-        from src.risk_engine import normalize_risk
+        from src.risk_engine import normalize_score
         values = np.array([3.0, 3.0, 3.0])
-        normed, _, _ = normalize_risk(values)
+        normed, _, _ = normalize_score(values)
         assert (normed == 50.0).all()
 
     def test_stored_bounds_reuse(self):
-        from src.risk_engine import normalize_risk
+        """
+        a) stored bounds from a clipped run equal the clipped min/max
+        b) reusing them on the same data gives identical scores
+        c) values beyond the stored bounds clip to [0,100] on reuse
+        """
+        from src.risk_engine import normalize_score
+        # 10 is an outlier, clipping at say 50th percentile will clip to 5.0
         values = np.array([1.0, 5.0, 10.0])
-        _, vmin, vmax = normalize_risk(values)
-        # Re-normalise new values with stored bounds
-        new_values = np.array([3.0, 7.0])
-        normed, _, _ = normalize_risk(new_values, vmin, vmax)
-        # 3.0 should be at (3-1)/(10-1)*100 = 22.2
-        assert abs(normed[0] - 22.222) < 0.1
+        
+        # Initial run with clipping at 60th percentile -> bounds should be [1.0, 6.0]
+        normed, vmin, vmax = normalize_score(values, clip_percentile=60)
+        
+        # a) Stored bounds equal the clipped min/max
+        assert vmin == 1.0
+        assert vmax == 6.0
+        
+        # b) Reusing them on same data gives identical scores
+        # Note: when reusing bounds, clip_percentile is None
+        reused_normed, _, _ = normalize_score(values, v_min=vmin, v_max=vmax, clip_percentile=None)
+        np.testing.assert_allclose(normed, reused_normed)
+        
+        # c) Values beyond stored bounds clip to [0,100]
+        new_values = np.array([0.0, 20.0])
+        new_normed, _, _ = normalize_score(new_values, v_min=vmin, v_max=vmax, clip_percentile=None)
+        assert new_normed[0] == 0.0    # 0.0 is below vmin=1.0, clips to 0
+        assert new_normed[1] == 100.0  # 20.0 is above vmax=6.0, clips to 100
 
-    def test_class_boundaries(self):
+    def test_clipping_caps_an_outlier(self):
+        from src.risk_engine import normalize_score
+        values = np.array([1.0, 2.0, 3.0, 100.0])
+        normed, vmin, vmax = normalize_score(values, clip_percentile=75)
+        # 75th percentile of [1,2,3,100] is 27.25. So 100 clips to 27.25. Max becomes 27.25.
+        # The output must be within [0,100]. The outlier 100 becomes score 100.
+        assert vmax == 27.25
+        assert normed.max() <= 100.0
+        assert normed[-1] == 100.0
+
+    def test_clip_percentile_100_equals_unclipped(self):
+        from src.risk_engine import normalize_score
+        values = np.array([1.0, 2.0, 3.0, 100.0])
+        norm100, vmin100, vmax100 = normalize_score(values, clip_percentile=100)
+        norm_none, vmin_none, vmax_none = normalize_score(values, clip_percentile=None)
+        np.testing.assert_allclose(norm100, norm_none)
+        assert vmin100 == vmin_none
+        assert vmax100 == vmax_none
+
+    def test_class_boundaries_upper_bound(self):
+        """Classify by upper bounds: <=25 LOW, <=50 MODERATE, <=75 HIGH, else CRITICAL."""
         from src.risk_engine import classify_risk
         from src.config_loader import get_config
         config = get_config()
         ranges = config['risk_class_ranges']
-        assert classify_risk([25], ranges) == ['LOW']
-        assert classify_risk([26], ranges) == ['MODERATE']
+
+        # Exact boundary values
+        assert classify_risk([0], ranges) == ['LOW']
+        assert classify_risk([25.0], ranges) == ['LOW']
+        assert classify_risk([25.5], ranges) == ['MODERATE']
         assert classify_risk([50], ranges) == ['MODERATE']
-        assert classify_risk([51], ranges) == ['HIGH']
+        assert classify_risk([50.5], ranges) == ['HIGH']
         assert classify_risk([75], ranges) == ['HIGH']
-        assert classify_risk([76], ranges) == ['CRITICAL']
+        assert classify_risk([75.5], ranges) == ['CRITICAL']
+        assert classify_risk([100], ranges) == ['CRITICAL']
+
+    def test_no_unknown_class(self):
+        """No score should ever produce UNKNOWN."""
+        from src.risk_engine import classify_risk
+        from src.config_loader import get_config
+        config = get_config()
+        ranges = config['risk_class_ranges']
+        test_scores = [0, 10, 25, 25.5, 30, 50, 50.5, 60, 75, 75.5, 90, 100, 150]
+        results = classify_risk(test_scores, ranges)
+        assert 'UNKNOWN' not in results, f"UNKNOWN found in {results}"
+
+    def test_nan_score_classified_as_low(self):
+        """NaN scores should be classified as LOW, never UNKNOWN."""
+        from src.risk_engine import classify_risk
+        from src.config_loader import get_config
+        config = get_config()
+        ranges = config['risk_class_ranges']
+        result = classify_risk([float('nan')], ranges)
+        assert result == ['LOW']
+        assert 'UNKNOWN' not in result
 
     def test_risk_on_fallback_mode(self):
         from src.risk_engine import compute_risk
@@ -292,7 +369,7 @@ class TestRiskEngine:
 # ────────────────────── EXPLAINABILITY TESTS ──────────────────────
 
 class TestExplainEngine:
-    def _make_risk_df(self):
+    def _make_risk_df_3seg(self):
         return pd.DataFrame({
             'segment_id': ['S-1-2-0', 'S-2-3-0', 'S-3-4-0'],
             'is_canonical': [True, True, True],
@@ -307,18 +384,92 @@ class TestExplainEngine:
             'risk_class': ['MODERATE', 'CRITICAL', 'HIGH'],
         })
 
+    def _make_10seg_risk_df(self):
+        """10 canonical segments at 13:00 with known values for rank verification."""
+        n = 10
+        return pd.DataFrame({
+            'segment_id': [f'S-{i}-0' for i in range(n)],
+            'is_canonical': [True] * n,
+            'time': ['13:00'] * n,
+            'exposure_value': np.linspace(0.1, 1.0, n),
+            'vulnerability_value': np.linspace(0.0, 0.9, n),
+            'access_penalty': np.linspace(0.0, 1.0, n),
+            'risk_score': np.linspace(5, 95, n),
+            'risk_class': ['LOW', 'LOW', 'LOW', 'MODERATE', 'MODERATE',
+                           'MODERATE', 'HIGH', 'HIGH', 'CRITICAL', 'CRITICAL'],
+        })
+
     def test_drivers_ordering_and_dominance(self):
         from src.explain_engine import compute_drivers
-        rdf = self._make_risk_df()
+        rdf = self._make_risk_df_3seg()
         drivers = compute_drivers(rdf)
         assert len(drivers) == 3
         for d in drivers:
             pcts = [drv['percentile'] for drv in d['drivers']]
             assert pcts == sorted(pcts, reverse=True), "Drivers should be ordered by percentile desc"
 
+    def test_percentile_over_canonical_at_same_time(self):
+        """Percentile rank computed over the 10 canonical segments at 13:00."""
+        from src.explain_engine import compute_drivers
+        rdf = self._make_10seg_risk_df()
+        drivers = compute_drivers(rdf)
+        assert len(drivers) == 10
+
+        # The last segment (index 9) has the highest values → percentile should be 1.0
+        last_drivers = drivers[9]['drivers']
+        for d in last_drivers:
+            assert d['percentile'] == 1.0, f"Top segment driver {d['driver']} should have percentile 1.0, got {d['percentile']}"
+
+        # The first segment (index 0) has the lowest values → percentile should be 0.1 (1/10)
+        first_drivers = drivers[0]['drivers']
+        for d in first_drivers:
+            assert d['percentile'] <= 0.2, f"Bottom segment driver {d['driver']} should have low percentile, got {d['percentile']}"
+
+    def test_low_street_no_dominant_driver(self):
+        """A LOW-risk street with low values should have no dominant drivers."""
+        from src.explain_engine import compute_drivers, build_explanation_text
+        rdf = self._make_10seg_risk_df()
+        drivers = compute_drivers(rdf)
+
+        # First segment: LOW risk, lowest values
+        low_street = drivers[0]
+        assert low_street['risk_class'] == 'LOW'
+        dominant = [d for d in low_street['drivers'] if d['is_dominant']]
+        assert len(dominant) == 0, f"LOW street should have no dominant drivers, got {[d['driver'] for d in dominant]}"
+
+        # Explanation text should say "no single dominant driver"
+        text = build_explanation_text(low_street, "Quiet Lane")
+        assert "no single dominant driver" in text.lower(), f"Expected 'no single dominant driver' in: {text}"
+
+    def test_low_street_wording_no_high_language(self):
+        """LOW-risk streets should never have 'high' or 'poor' language."""
+        from src.explain_engine import compute_drivers, build_explanation_text
+        rdf = self._make_10seg_risk_df()
+        drivers = compute_drivers(rdf)
+        low_street = drivers[0]
+        text = build_explanation_text(low_street, "Quiet Lane")
+        text_lower = text.lower()
+        # 'high' should not appear except as part of 'highest'
+        stripped = text_lower.replace('highest', '')
+        assert 'high' not in stripped, f"LOW street text should not contain 'high': {text}"
+        assert 'poor' not in text_lower, f"LOW street text should not contain 'poor': {text}"
+
+    def test_critical_street_has_dominant_drivers(self):
+        """A CRITICAL street should have at least one dominant driver."""
+        from src.explain_engine import compute_drivers, build_explanation_text
+        rdf = self._make_10seg_risk_df()
+        drivers = compute_drivers(rdf)
+        critical_street = drivers[9]
+        assert critical_street['risk_class'] == 'CRITICAL'
+        dominant = [d for d in critical_street['drivers'] if d['is_dominant']]
+        assert len(dominant) > 0, "CRITICAL street should have dominant drivers"
+
+        text = build_explanation_text(critical_street)
+        assert "key drivers" in text.lower(), f"Expected 'Key drivers' in: {text}"
+
     def test_hottest_vs_highest_risk_differ(self):
         from src.explain_engine import compare_hottest_vs_highest_risk
-        rdf = self._make_risk_df()
+        rdf = self._make_risk_df_3seg()
         # Hottest = highest exposure_value = S-1-2-0 (0.8)
         # Highest risk = highest risk_score = S-2-3-0 (80)
         exp_df = rdf[['segment_id', 'exposure_value', 'is_canonical']].copy()
@@ -327,11 +478,12 @@ class TestExplainEngine:
         assert comparison['highest_risk_segment_id'] == 'S-2-3-0'
         assert comparison['same_street'] == False
 
-    def test_explanation_text(self):
+    def test_explanation_text_contains_required_fields(self):
         from src.explain_engine import compute_drivers, build_explanation_text
-        rdf = self._make_risk_df()
+        rdf = self._make_risk_df_3seg()
         drivers = compute_drivers(rdf)
         text = build_explanation_text(drivers[0], "Main Street")
         assert "Main Street" in text
         assert "13:00" in text
         assert "risk score" in text.lower() or "risk" in text.lower()
+

@@ -16,32 +16,63 @@ logger = logging.getLogger(__name__)
 
 # ──────── central normalisation (reusable with stored bounds) ────────
 
-def normalize_risk(values, v_min=None, v_max=None):
+def normalize_score(values, canonical_mask=None, v_min=None, v_max=None, clip_percentile=None, scale=100.0):
     """
-    Min-max normalise to [0, 100].
-    If v_min == v_max (zero variance), return 50.
-    Clip to [0, 100].
+    Central normalisation function with optional clipping.
+    If canonical_mask is provided, clipping and min-max bounds are computed
+    ONLY over the canonical values.
+    Raw values above the clip_percentile are clipped to that value before min-max.
+    Min-max normalises to [0, scale].
+    If v_min == v_max (zero variance), return scale / 2.
+    Output is always clipped to [0, scale].
     Returns (normalised_array, v_min, v_max).
     """
+    canon_vals = values if canonical_mask is None else values[canonical_mask]
+
+    if clip_percentile is not None and clip_percentile < 100:
+        if v_max is None:
+            upper_bound = np.percentile(canon_vals, clip_percentile)
+            values = np.clip(values, None, upper_bound)
+            canon_vals = np.clip(canon_vals, None, upper_bound)
+            
     if v_min is None:
-        v_min = values.min()
+        v_min = canon_vals.min()
     if v_max is None:
-        v_max = values.max()
+        v_max = canon_vals.max()
+        
     if v_max == v_min:
-        return np.full_like(values, 50.0, dtype=float), v_min, v_max
-    normed = (values - v_min) / (v_max - v_min) * 100
-    return np.clip(normed, 0, 100), v_min, v_max
+        return np.full_like(values, scale / 2.0, dtype=float), v_min, v_max
+        
+    normed = (values - v_min) / (v_max - v_min) * scale
+    return np.clip(normed, 0, scale), v_min, v_max
 
 
 def classify_risk(scores, class_ranges):
-    """Assign risk_class from config class ranges."""
+    """
+    Assign risk_class by upper-bound thresholds from config.
+    <=25 LOW, <=50 MODERATE, <=75 HIGH, else CRITICAL.
+    NaN scores are classified as 'LOW' (defensive default, logged upstream).
+    No UNKNOWN class may be produced.
+    """
+    # Build sorted list of (upper_bound, class_name)
+    bounds = []
+    for cls_name, (lo, hi) in class_ranges.items():
+        bounds.append((hi, cls_name))
+    bounds.sort(key=lambda x: x[0])  # sort by upper bound ascending
+
     classes = []
     for s in scores:
-        assigned = 'UNKNOWN'
-        for cls_name, (lo, hi) in class_ranges.items():
-            if lo <= s <= hi:
+        if np.isnan(s):
+            classes.append('LOW')  # defensive: NaN → LOW (logged upstream)
+            continue
+        assigned = None
+        for upper, cls_name in bounds:
+            if s <= upper:
                 assigned = cls_name
                 break
+        if assigned is None:
+            # Score exceeds all upper bounds → last (highest) class
+            assigned = bounds[-1][1]
         classes.append(assigned)
     return classes
 
@@ -87,6 +118,13 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
         merged = merged.merge(vuln_lookup.reset_index(), on='segment_id', how='left')
         merged = merged.merge(cool_lookup.reset_index(), on='segment_id', how='left')
 
+        # Handle NaN in inputs: fill with 0 and log
+        nan_vuln = merged['vulnerability_value'].isna().sum()
+        nan_access = merged['access_penalty'].isna().sum()
+        if nan_vuln > 0:
+            logger.warning(f"[{t}] {nan_vuln} segments have NaN vulnerability_value (missing from vulnerability lookup). Filling with 0.")
+        if nan_access > 0:
+            logger.warning(f"[{t}] {nan_access} segments have NaN access_penalty (missing from cooling lookup). Filling with 0.")
         merged['vulnerability_value'] = merged['vulnerability_value'].fillna(0.0)
         merged['access_penalty'] = merged['access_penalty'].fillna(0.0)
 
@@ -100,20 +138,37 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
         canon_raw = merged.loc[merged['is_canonical'] == True, 'final_risk_raw'].values
         all_canonical_raw.append(canon_raw)
 
-    # Phase 2: pooled normalisation
+    # Phase 2: pooled normalisation (compute global min/max over all canonicals)
     pooled_canonical = np.concatenate(all_canonical_raw)
+    clip_pct = config.get('risk', {}).get('normalization_clip_percentile', 99)
 
     if stored_bounds is not None:
         scope_min, scope_max = stored_bounds
     else:
+        if clip_pct is not None and clip_pct < 100:
+            pooled_upper = np.percentile(pooled_canonical, clip_pct)
+            pooled_canonical = np.clip(pooled_canonical, None, pooled_upper)
         scope_min = pooled_canonical.min()
         scope_max = pooled_canonical.max()
+
+    clip_pct = config.get('risk', {}).get('normalization_clip_percentile', 99)
 
     # Phase 3: apply normalisation and classify
     results = {}
     for t, merged in all_records.items():
-        scores, _, _ = normalize_risk(merged['final_risk_raw'].values, scope_min, scope_max)
+        scores, _, _ = normalize_score(
+            merged['final_risk_raw'].values, 
+            canonical_mask=None,  # bounds already computed pooled
+            v_min=scope_min, 
+            v_max=scope_max, 
+            clip_percentile=None,  # already clipped in Phase 2 or stored bounds
+            scale=100.0
+        )
         merged['risk_score'] = scores
+        # Log NaN scores before classification
+        nan_count = np.isnan(scores).sum()
+        if nan_count > 0:
+            logger.warning(f"[{t}] {nan_count} NaN risk_scores found after normalisation. Source: NaN in final_risk_raw from missing vulnerability/cooling data. Classifying as LOW.")
         merged['risk_class'] = classify_risk(scores, class_ranges)
         merged['computation_mode'] = mode
         merged['prov_status'] = MODELLED
