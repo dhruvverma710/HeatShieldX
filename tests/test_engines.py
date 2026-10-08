@@ -335,15 +335,42 @@ class TestRiskEngine:
         results = classify_risk(test_scores, ranges)
         assert 'UNKNOWN' not in results, f"UNKNOWN found in {results}"
 
-    def test_nan_score_classified_as_low(self):
-        """NaN scores should be classified as LOW, never UNKNOWN."""
-        from src.risk_engine import classify_risk
-        from src.config_loader import get_config
-        config = get_config()
-        ranges = config['risk_class_ranges']
-        result = classify_risk([float('nan')], ranges)
-        assert result == ['LOW']
-        assert 'UNKNOWN' not in result
+    def test_nan_scores_flagged_and_excluded_from_bounds(self):
+        """NaN scores (missing vulnerability/cooling lookups) are flagged (risk_valid=False) and excluded from normalisation bounds."""
+        from src.risk_engine import compute_risk
+        from src.vulnerability_engine import compute_vulnerability
+        segs = _make_segments()
+        blds = _make_buildings()
+        vuln = compute_vulnerability(segs, blds)
+
+        # Introduce a missing segment in vulnerability lookup (NaN vulnerability)
+        vuln_with_nan = vuln.copy()
+        vuln_with_nan.loc[vuln_with_nan['segment_id'] == 'S-1-2-0', 'vulnerability_value'] = np.nan
+
+        cooling = pd.DataFrame({
+            'segment_id': segs['segment_id'],
+            'street_id': segs['street_id'],
+            'is_canonical': segs['is_canonical'],
+            'access_penalty': 0.5,
+        })
+
+        exp = self._make_exposure_results(segs)
+        risk_results, bounds = compute_risk(exp, vuln_with_nan, cooling, "geometric")
+
+        # The NaN segment should be flagged with risk_valid=False
+        df_13 = list(risk_results.values())[0]
+        nan_row = df_13[df_13['segment_id'] == 'S-1-2-0'].iloc[0]
+        assert nan_row['risk_valid'] == False
+        assert np.isnan(nan_row['risk_score'])
+
+        # Valid segments should be flagged with risk_valid=True
+        valid_row = df_13[df_13['segment_id'] == 'S-2-3-0'].iloc[0]
+        assert valid_row['risk_valid'] == True
+        assert not np.isnan(valid_row['risk_score'])
+
+        # Check bounds: NaN value is excluded from normalisation bounds
+        assert not np.isnan(bounds[0])
+        assert not np.isnan(bounds[1])
 
     def test_risk_on_fallback_mode(self):
         from src.risk_engine import compute_risk
@@ -442,17 +469,68 @@ class TestExplainEngine:
         assert "no single dominant driver" in text.lower(), f"Expected 'no single dominant driver' in: {text}"
 
     def test_low_street_wording_no_high_language(self):
-        """LOW-risk streets should never have 'high' or 'poor' language."""
+        """LOW-risk streets should never have 'moderate', 'high', or 'poor' language next to printed percentile."""
         from src.explain_engine import compute_drivers, build_explanation_text
         rdf = self._make_10seg_risk_df()
         drivers = compute_drivers(rdf)
         low_street = drivers[0]
-        text = build_explanation_text(low_street, "Quiet Lane")
-        text_lower = text.lower()
-        # 'high' should not appear except as part of 'highest'
-        stripped = text_lower.replace('highest', '')
-        assert 'high' not in stripped, f"LOW street text should not contain 'high': {text}"
-        assert 'poor' not in text_lower, f"LOW street text should not contain 'poor': {text}"
+
+        # Test when LOW street has a dominant driver artificially
+        low_street_dom = dict(low_street)
+        low_street_dom['drivers'] = [
+            {'driver': 'sun exposure / low shade', 'value': 0.8, 'percentile': 0.8, 'level': 'HIGH', 'is_dominant': True}
+        ]
+        text_dom = build_explanation_text(low_street_dom, "Quiet Lane")
+        assert "no single factor puts this street at high risk" in text_dom.lower()
+        assert "moderate" not in text_dom.lower()
+        assert "poor" not in text_dom.lower()
+
+        text_normal = build_explanation_text(low_street, "Quiet Lane")
+        text_lower = text_normal.lower()
+        assert "moderate" not in text_lower
+        assert "poor" not in text_lower
+        stripped = text_lower.replace('highest', '').replace('no single factor puts this street at high risk', '')
+        assert 'high' not in stripped, f"LOW street text should not contain 'high': {text_normal}"
+
+    def test_explain_tie_guard(self):
+        """Driver is dominant only if spread > min_driver_spread."""
+        from src.explain_engine import compute_drivers
+        rdf = self._make_10seg_risk_df()
+        
+        # Override config to require huge spread
+        from src.config_loader import get_config
+        config = get_config()
+        if 'explain' not in config:
+            config['explain'] = {}
+        old_spread = config['explain'].get('min_driver_spread', 0)
+        config['explain']['min_driver_spread'] = 100.0  # Impossible to meet
+        
+        drivers = compute_drivers(rdf, config)
+        
+        # Restore config
+        config['explain']['min_driver_spread'] = old_spread
+        
+        for d in drivers:
+            for drv in d['drivers']:
+                assert not drv['is_dominant'], f"Driver {drv['driver']} should not be dominant due to tie guard"
+
+    def test_solar_shade_merge_when_same_quantity(self):
+        """If solar_exposure and shade_deficit are derived from exposure_value (same quantity), merge into 'sun exposure / low shade'."""
+        from src.explain_engine import compute_drivers
+        rdf = self._make_10seg_risk_df()
+        drivers = compute_drivers(rdf)
+        driver_names = [d['driver'] for d in drivers[0]['drivers']]
+        assert 'sun exposure / low shade' in driver_names
+        assert 'solar_exposure' not in driver_names
+        assert 'shade_deficit' not in driver_names
+
+        # When solar_exposure and shade_deficit differ, they should not be merged
+        rdf_diff = self._make_risk_df_3seg()
+        drivers_diff = compute_drivers(rdf_diff)
+        driver_names_diff = [d['driver'] for d in drivers_diff[0]['drivers']]
+        assert 'solar_exposure' in driver_names_diff
+        assert 'shade_deficit' in driver_names_diff
+        assert 'sun exposure / low shade' not in driver_names_diff
 
     def test_critical_street_has_dominant_drivers(self):
         """A CRITICAL street should have at least one dominant driver."""

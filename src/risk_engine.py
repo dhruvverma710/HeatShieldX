@@ -20,7 +20,7 @@ def normalize_score(values, canonical_mask=None, v_min=None, v_max=None, clip_pe
     """
     Central normalisation function with optional clipping.
     If canonical_mask is provided, clipping and min-max bounds are computed
-    ONLY over the canonical values.
+    ONLY over non-NaN canonical values.
     Raw values above the clip_percentile are clipped to that value before min-max.
     Min-max normalises to [0, scale].
     If v_min == v_max (zero variance), return scale / 2.
@@ -28,23 +28,28 @@ def normalize_score(values, canonical_mask=None, v_min=None, v_max=None, clip_pe
     Returns (normalised_array, v_min, v_max).
     """
     canon_vals = values if canonical_mask is None else values[canonical_mask]
+    canon_vals = canon_vals[~np.isnan(canon_vals)]
+
+    if len(canon_vals) == 0:
+        return np.full_like(values, np.nan, dtype=float), 0.0, 100.0
 
     if clip_percentile is not None and clip_percentile < 100:
         if v_max is None:
             upper_bound = np.percentile(canon_vals, clip_percentile)
-            values = np.clip(values, None, upper_bound)
+            values = np.where(np.isnan(values), np.nan, np.clip(values, None, upper_bound))
             canon_vals = np.clip(canon_vals, None, upper_bound)
             
     if v_min is None:
-        v_min = canon_vals.min()
+        v_min = float(canon_vals.min())
     if v_max is None:
-        v_max = canon_vals.max()
+        v_max = float(canon_vals.max())
         
     if v_max == v_min:
-        return np.full_like(values, scale / 2.0, dtype=float), v_min, v_max
+        res = np.where(np.isnan(values), np.nan, scale / 2.0)
+        return res, v_min, v_max
         
     normed = (values - v_min) / (v_max - v_min) * scale
-    return np.clip(normed, 0, scale), v_min, v_max
+    return np.where(np.isnan(values), np.nan, np.clip(normed, 0, scale)), v_min, v_max
 
 
 def classify_risk(scores, class_ranges):
@@ -118,15 +123,12 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
         merged = merged.merge(vuln_lookup.reset_index(), on='segment_id', how='left')
         merged = merged.merge(cool_lookup.reset_index(), on='segment_id', how='left')
 
-        # Handle NaN in inputs: fill with 0 and log
-        nan_vuln = merged['vulnerability_value'].isna().sum()
-        nan_access = merged['access_penalty'].isna().sum()
-        if nan_vuln > 0:
-            logger.warning(f"[{t}] {nan_vuln} segments have NaN vulnerability_value (missing from vulnerability lookup). Filling with 0.")
-        if nan_access > 0:
-            logger.warning(f"[{t}] {nan_access} segments have NaN access_penalty (missing from cooling lookup). Filling with 0.")
-        merged['vulnerability_value'] = merged['vulnerability_value'].fillna(0.0)
-        merged['access_penalty'] = merged['access_penalty'].fillna(0.0)
+        # Check for missing / NaN lookups (do NOT fill access_penalty or vulnerability with 0.0)
+        invalid_mask = merged['vulnerability_value'].isna() | merged['access_penalty'].isna() | merged['exposure_value'].isna()
+        nan_count = invalid_mask.sum()
+        if nan_count > 0:
+            logger.warning(f"[{t}] {nan_count} segments have NaN or missing vulnerability/cooling lookups.")
+        merged['risk_valid'] = ~invalid_mask
 
         merged['baseline_risk'] = merged['exposure_value'] * merged['vulnerability_value']
         merged['final_risk_raw'] = merged['baseline_risk'] * (1 + merged['access_penalty'])
@@ -134,24 +136,30 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
         merged['time'] = t
         all_records[t] = merged
 
-        # Collect canonical raw values for pooled normalisation
-        canon_raw = merged.loc[merged['is_canonical'] == True, 'final_risk_raw'].values
+        # Collect non-NaN canonical raw values for pooled normalisation
+        canon_raw = merged.loc[(merged['is_canonical'] == True) & (merged['risk_valid'] == True), 'final_risk_raw'].dropna().values
         all_canonical_raw.append(canon_raw)
 
-    # Phase 2: pooled normalisation (compute global min/max over all canonicals)
-    pooled_canonical = np.concatenate(all_canonical_raw)
+    # Phase 2: pooled normalisation (compute global min/max over all valid canonicals)
+    if all_canonical_raw:
+        pooled_canonical = np.concatenate(all_canonical_raw)
+        pooled_canonical = pooled_canonical[~np.isnan(pooled_canonical)]
+    else:
+        pooled_canonical = np.array([])
+
     clip_pct = config.get('risk', {}).get('normalization_clip_percentile', 99)
 
     if stored_bounds is not None:
         scope_min, scope_max = stored_bounds
     else:
-        if clip_pct is not None and clip_pct < 100:
-            pooled_upper = np.percentile(pooled_canonical, clip_pct)
-            pooled_canonical = np.clip(pooled_canonical, None, pooled_upper)
-        scope_min = pooled_canonical.min()
-        scope_max = pooled_canonical.max()
-
-    clip_pct = config.get('risk', {}).get('normalization_clip_percentile', 99)
+        if len(pooled_canonical) > 0:
+            if clip_pct is not None and clip_pct < 100:
+                pooled_upper = float(np.percentile(pooled_canonical, clip_pct))
+                pooled_canonical = np.clip(pooled_canonical, None, pooled_upper)
+            scope_min = float(pooled_canonical.min())
+            scope_max = float(pooled_canonical.max())
+        else:
+            scope_min, scope_max = 0.0, 100.0
 
     # Phase 3: apply normalisation and classify
     results = {}
@@ -168,7 +176,7 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
         # Log NaN scores before classification
         nan_count = np.isnan(scores).sum()
         if nan_count > 0:
-            logger.warning(f"[{t}] {nan_count} NaN risk_scores found after normalisation. Source: NaN in final_risk_raw from missing vulnerability/cooling data. Classifying as LOW.")
+            logger.warning(f"[{t}] {nan_count} NaN risk_scores found after normalisation. Flagged with risk_valid=False.")
         merged['risk_class'] = classify_risk(scores, class_ranges)
         merged['computation_mode'] = mode
         merged['prov_status'] = MODELLED
@@ -179,7 +187,8 @@ def compute_risk(exposure_results: dict, vulnerability: pd.DataFrame,
             'segment_id', 'street_id', 'is_canonical', 'time',
             'exposure_value', 'vulnerability_value', 'access_penalty',
             'baseline_risk', 'final_risk_raw', 'risk_score', 'risk_class',
-            'computation_mode', 'prov_status', 'estimated_flag', 'prov_assumptions_version',
+            'risk_valid', 'computation_mode', 'prov_status', 'estimated_flag',
+            'prov_assumptions_version',
         ]
         results[t] = merged[out_cols]
 

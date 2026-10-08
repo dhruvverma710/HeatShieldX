@@ -29,14 +29,10 @@ def _level_from_percentile(percentile, bands):
 def _class_consistent_adjective(risk_class, driver_level):
     """
     Return a wording adjective consistent with the risk class.
-    LOW-risk streets never get 'high' or 'poor' language.
+    LOW-risk streets never get 'moderate', 'high', or 'poor' language.
     """
     if risk_class == 'LOW':
-        return {
-            'LOW': 'low',
-            'MODERATE': 'moderate',
-            'HIGH': 'moderate',
-        }.get(driver_level, 'moderate')
+        return 'low'
     elif risk_class == 'MODERATE':
         return {
             'LOW': 'low',
@@ -58,11 +54,13 @@ def compute_drivers(risk_df, config=None):
     Drivers:
     - solar_exposure = exposure_fraction × sun_factor  (from exposure data)
     - shade_deficit = 1 - shade_fraction  (low shade = risk driver)
+      (If solar_exposure and shade_deficit are derived from the same quantity e.g. exposure_value,
+       they are merged into 'sun exposure / low shade')
     - vulnerability = vulnerability_value
     - cooling_access = access_penalty
 
     Each driver gets: value, scope percentile (over canonical segments AT THE SAME TIME),
-    level (LOW/MODERATE/HIGH), is_dominant (percentile >= threshold).
+    level (LOW/MODERATE/HIGH), is_dominant (percentile >= threshold AND spread > min_driver_spread).
     Ordered by percentile descending.
     """
     if config is None:
@@ -70,6 +68,7 @@ def compute_drivers(risk_df, config=None):
 
     threshold = config['risk']['driver_percentile_threshold']
     bands = config['risk']['driver_level_bands']
+    min_spread = config.get('explain', {}).get('min_driver_spread', 0.05)
 
     # Group by time so percentiles are computed within same-time canonical segments
     times = risk_df['time'].unique() if 'time' in risk_df.columns else ['']
@@ -99,6 +98,13 @@ def compute_drivers(risk_df, config=None):
         scope['vulnerability'] = canonical['vulnerability_value'].values
         scope['cooling_access'] = canonical['access_penalty'].values
 
+        # Check if solar_exposure and shade_deficit are identical quantities
+        same_quantity = np.array_equal(scope['solar_exposure'], scope['shade_deficit'])
+        if same_quantity:
+            scope['sun exposure / low shade'] = scope['solar_exposure']
+            del scope['solar_exposure']
+            del scope['shade_deficit']
+
         for _, row in time_df.iterrows():
             seg_id = row['segment_id']
 
@@ -116,18 +122,26 @@ def compute_drivers(risk_df, config=None):
             vuln_val = row['vulnerability_value']
             cool_val = row['access_penalty']
 
-            drivers = {
-                'solar_exposure': solar_val,
-                'shade_deficit': shade_val,
-                'vulnerability': vuln_val,
-                'cooling_access': cool_val,
-            }
+            if same_quantity:
+                drivers = {
+                    'sun exposure / low shade': solar_val,
+                    'vulnerability': vuln_val,
+                    'cooling_access': cool_val,
+                }
+            else:
+                drivers = {
+                    'solar_exposure': solar_val,
+                    'shade_deficit': shade_val,
+                    'vulnerability': vuln_val,
+                    'cooling_access': cool_val,
+                }
 
             driver_list = []
             for name, val in drivers.items():
                 pct = _percentile_rank(scope[name], val)
                 lvl = _level_from_percentile(pct, bands)
-                dominant = pct >= threshold
+                driver_spread = float(np.max(scope[name]) - np.min(scope[name])) if len(scope[name]) > 0 else 0.0
+                dominant = (pct >= threshold) and (driver_spread > min_spread)
                 driver_list.append({
                     'driver': name,
                     'value': val,
@@ -172,20 +186,28 @@ def build_explanation_text(driver_record, street_name=None):
 
     text = f"At {time}, {label} has a risk score of {risk_score:.0f} ({risk_class})."
 
-    if dominant_names:
-        text += f" Key drivers: {', '.join(dominant_names)}."
+    if risk_class == 'LOW':
+        if dominant:
+            text += " No single factor puts this street at high risk."
+        else:
+            text += " No single dominant driver."
     else:
-        text += " No single dominant driver."
+        if dominant_names:
+            text += f" Key drivers: {', '.join(dominant_names)}."
+        else:
+            text += " No single dominant driver."
 
     # Add class-consistent detail for the top driver
     if dominant:
         top = dominant[0]
         adj = _class_consistent_adjective(risk_class, top['level'])
-        text += f" {top['driver'].replace('_', ' ').capitalize()} is {adj} (percentile {top['percentile']:.0%})."
+        driver_title = top['driver'].replace('_', ' ').capitalize()
+        text += f" {driver_title} is {adj} (percentile {top['percentile']:.0%})."
     elif drivers:
         top = drivers[0]
         adj = _class_consistent_adjective(risk_class, top['level'])
-        text += f" The leading factor is {top['driver'].replace('_', ' ')} ({adj}, percentile {top['percentile']:.0%})."
+        driver_title = top['driver'].replace('_', ' ')
+        text += f" The leading factor is {driver_title} ({adj}, percentile {top['percentile']:.0%})."
 
     return text
 

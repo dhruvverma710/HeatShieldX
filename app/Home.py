@@ -1,72 +1,51 @@
 import streamlit as st
-import folium
-from streamlit_folium import st_folium
 import sys
 from pathlib import Path
 
-# Add project root to path
+# Add project root to sys.path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.config_loader import get_config
-from src.data_engine import load_street_network, load_buildings
+from src.dashboard_data import load_dashboard_data, get_exposure_mode_label
 
-st.set_page_config(page_title="HeatShield X", layout="wide")
+st.set_page_config(
+    page_title="HeatShield X - Extreme Heat Risk Platform",
+    page_icon="🌡️",
+    layout="wide",
+)
 
-st.title("HeatShield X: Demo Area")
-
-@st.cache_data
-def load_data(area):
-    streets = load_street_network(area)
-    buildings = load_buildings(area)
-    
-    # Project to EPSG:4326 for folium
-    streets_wgs84 = streets.to_crs("EPSG:4326")
-    buildings_wgs84 = buildings.to_crs("EPSG:4326")
-    
-    return streets_wgs84, buildings_wgs84, streets, buildings
+st.title("🌡️ HeatShield X: Extreme Heat Risk Platform")
+st.caption("Hyper-local heat exposure, vulnerability, and cooling access prioritisation system.")
 
 try:
-    config = get_config()
-    area = config['demo_area']
-
-    with st.sidebar:
-        st.header("Configuration")
-        st.write(f"**Version**: {config['config_version']}")
-        st.write(f"**Demo Area**: {area}")
-        
-    streets_wgs84, buildings_wgs84, streets_proj, buildings_proj = load_data(area)
+    data = load_dashboard_data()
+    config = data['config']
+    mode_label = get_exposure_mode_label(data.get('mode'))
     
-    with st.sidebar:
+    st.markdown("---")
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader("System Overview")
+        st.write(f"**Demo Area**: {config['demo_area']}")
+        st.write(f"**Config Version**: {config['config_version']}")
+        st.write(f"**Computation Mode**: {mode_label}")
+        
+        st.info("⚠️ **Persistent Disclaimer**: HeatShield X provides modelled prioritisation scores for urban planning and emergency response, not medical thresholds. Population and facility distributions include synthetic estimates.")
+        
+        st.page_link("pages/1_Planner.py", label="🚀 Open HeatShield X Risk Planner", icon="🗺️", use_container_width=True)
+
+    with col2:
         st.subheader("Data Summary")
-        st.write(f"**Streets**: {len(streets_proj)}")
-        st.write(f"**Buildings**: {len(buildings_proj)}")
-        
-        st.write("**Height Sources:**")
-        counts = buildings_proj['height_source'].value_counts()
-        for source, count in counts.items():
-            st.write(f"- {source}: {count}")
+        streets = data['streets']
+        buildings = data.get('buildings')
+        st.metric("Total Street Segments", len(streets))
+        st.metric("Canonical Streets", streets['is_canonical'].sum())
+        if 'vulnerability' in data:
+            st.metric("Vulnerability Coverage", len(data['vulnerability']))
+        if 'cooling_access' in data:
+            st.metric("Cooling Access Network Nodes", len(data['cooling_access']))
 
-    # Create map
-    # Get center
-    bounds = buildings_wgs84.total_bounds # [minx, miny, maxx, maxy]
-    center_lat = (bounds[1] + bounds[3]) / 2
-    center_lon = (bounds[0] + bounds[2]) / 2
-    
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
-    
-    # Add streets
-    folium.GeoJson(
-        streets_wgs84,
-        style_function=lambda x: {'color': '#333333', 'weight': 2}
-    ).add_to(m)
-    
-    # Add buildings
-    folium.GeoJson(
-        buildings_wgs84,
-        style_function=lambda x: {'fillColor': '#ff9999', 'color': '#ff0000', 'weight': 1, 'fillOpacity': 0.5}
-    ).add_to(m)
-    
-    st_folium(m, width=1200, height=600, returned_objects=[])
-    
 except Exception as e:
-    st.error(f"Error initializing app: {e}")
+    st.error(f"Error loading system data: {e}")
+    st.info("If precomputed files are missing, please run: `python scripts/precompute.py`")

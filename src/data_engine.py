@@ -216,3 +216,270 @@ def get_data_engine_summary(area):
         'crs_streets': streets.crs.to_string(),
         'crs_buildings': buildings.crs.to_string()
     }
+
+
+# ──────────────────────── DATA LAYER & CACHING ────────────────────────
+
+try:
+    import streamlit as st
+    cache_data = st.cache_data
+except ImportError:
+    def cache_data(func=None, **kwargs):
+        if func is None:
+            return lambda f: f
+        return func
+
+
+@cache_data
+def load_dashboard_data(area=None, mode=None):
+    """
+    Cached data loader for dashboard and data layer.
+    Loads precomputed segments, risk records, drivers/exposure inputs, cooling access,
+    vulnerability, and scope bounds.
+    If any precomputed cache is missing, raises RuntimeError("run python scripts/precompute.py").
+    """
+    config = get_config()
+    if area is None:
+        area = config['demo_area']
+    area_hash = _get_area_hash(area)
+    cfg_version = config['config_version'].replace('.', '_')
+    times = config['canonical_times']
+
+    # Load streets
+    try:
+        streets = load_street_network(area)
+    except Exception as e:
+        raise RuntimeError(f"Missing streets cache or network data: {e}. Please run python scripts/precompute.py")
+
+    # Paths for vulnerability, cooling, bounds
+    vuln_path = PROCESSED_DIR / f"vulnerability_{area_hash}_{cfg_version}.parquet"
+    cooling_path = PROCESSED_DIR / f"cooling_{area_hash}_{cfg_version}.parquet"
+    bounds_path = PROCESSED_DIR / f"risk_bounds_{area_hash}_{cfg_version}.parquet"
+
+    for p in [vuln_path, cooling_path, bounds_path]:
+        if not p.exists():
+            raise RuntimeError(f"Missing precomputed file {p.name}. Please run python scripts/precompute.py")
+
+    vulnerability = pd.read_parquet(vuln_path)
+    cooling_access = pd.read_parquet(cooling_path)
+    scope_bounds = pd.read_parquet(bounds_path)
+
+    # Determine mode
+    if mode is None:
+        comp_mode = config.get('computation_mode', 'auto')
+        if comp_mode in ['geometric', 'fallback']:
+            mode = comp_mode
+        else:
+            geo_09 = PROCESSED_DIR / f"risk_{area_hash}_{cfg_version}_0900_geometric.parquet"
+            mode = 'geometric' if geo_09.exists() else 'fallback'
+
+    risk_records = {}
+    exposure_records = {}
+
+    for t in times:
+        hour, minute = map(int, t.split(':'))
+        r_path = PROCESSED_DIR / f"risk_{area_hash}_{cfg_version}_{hour:02d}{minute:02d}_{mode}.parquet"
+        e_path = PROCESSED_DIR / f"exposure_{area_hash}_{cfg_version}_{hour:02d}{minute:02d}_{mode}.parquet"
+
+        if not r_path.exists():
+            raise RuntimeError(f"Missing precomputed risk file {r_path.name}. Please run python scripts/precompute.py")
+
+        r_df = pd.read_parquet(r_path)
+        if 'name' not in r_df.columns and 'name' in streets.columns:
+            r_df = r_df.merge(streets[['segment_id', 'name', 'highway']], on='segment_id', how='left')
+        risk_records[t] = r_df
+
+        if e_path.exists():
+            exposure_records[t] = pd.read_parquet(e_path)
+
+    return {
+        'streets': streets,
+        'vulnerability': vulnerability,
+        'cooling_access': cooling_access,
+        'scope_bounds': scope_bounds,
+        'risk_records': risk_records,
+        'exposure_records': exposure_records,
+        'mode': mode,
+        'config': config,
+    }
+
+
+def _to_minutes(time_input):
+    """Convert string HH:MM or integer minutes to minutes from midnight."""
+    if isinstance(time_input, str):
+        if ':' in time_input:
+            h, m = map(int, time_input.split(':'))
+            return h * 60 + m
+        return int(time_input)
+    return int(time_input)
+
+
+def get_snapshot(time_input, data=None):
+    """
+    Get risk snapshot at specified time (HH:MM or minutes from midnight).
+    Canonical times return cached record unchanged.
+    Interpolates linearly between canonical times for risk_score, exposure_value,
+    shade_fraction, exposure_fraction. Recomputes risk_class from interpolated score.
+    Times outside 09:00-17:00 (540-1020 minutes) raise ValueError.
+    """
+    time_minutes = _to_minutes(time_input)
+    if time_minutes < 540 or time_minutes > 1020:
+        raise ValueError(f"Time {time_minutes} minutes ({time_minutes // 60:02d}:{time_minutes % 60:02d}) is outside valid range 09:00-17:00 (540-1020 minutes).")
+
+    if data is None:
+        data = load_dashboard_data()
+
+    canonical_map = {
+        "09:00": 540,
+        "11:00": 660,
+        "13:00": 780,
+        "15:00": 900,
+        "17:00": 1020,
+    }
+
+    # Exact canonical match
+    for t_str, t_min in canonical_map.items():
+        if time_minutes == t_min:
+            return data['risk_records'][t_str].copy()
+
+    # Between two canonical times
+    sorted_canon = sorted(canonical_map.items(), key=lambda x: x[1])
+    t1_str, t1_min = sorted_canon[0]
+    t2_str, t2_min = sorted_canon[-1]
+
+    for i in range(len(sorted_canon) - 1):
+        if sorted_canon[i][1] <= time_minutes <= sorted_canon[i+1][1]:
+            t1_str, t1_min = sorted_canon[i]
+            t2_str, t2_min = sorted_canon[i+1]
+            break
+
+    alpha = (time_minutes - t1_min) / float(t2_min - t1_min)
+
+    df1 = data['risk_records'][t1_str].copy()
+    df2 = data['risk_records'][t2_str].copy()
+
+    interp_df = df1.copy()
+    interp_cols = ['risk_score', 'exposure_value', 'shade_fraction', 'exposure_fraction']
+
+    for col in interp_cols:
+        if col in df1.columns and col in df2.columns:
+            interp_df[col] = (1.0 - alpha) * df1[col].astype(float) + alpha * df2[col].astype(float)
+
+    # Recompute risk class
+    from src.risk_engine import classify_risk
+    class_ranges = data['config']['risk_class_ranges']
+    interp_df['risk_class'] = classify_risk(interp_df['risk_score'].values, class_ranges)
+
+    # Flags and time label
+    h = time_minutes // 60
+    m = time_minutes % 60
+    interp_df['time'] = f"{h:02d}:{m:02d}"
+    interp_df['prov_status'] = 'INTERPOLATED'
+    interp_df['prov_obs_est'] = ESTIMATED
+    interp_df['estimated_flag'] = True
+
+    return interp_df
+
+
+def nearest_canonical_segment(lat, lon, data=None):
+    """
+    Project (lat, lon) to metric CRS, use spatial index, return nearest canonical segment dict/row.
+    Returns None if distance > dashboard.click_tolerance_m.
+    """
+    from shapely.geometry import Point
+
+    if data is None:
+        data = load_dashboard_data()
+
+    streets = data['streets']
+    canon_segs = streets[streets['is_canonical'] == True].copy()
+    click_tol = data['config'].get('dashboard', {}).get('click_tolerance_m', 50.0)
+
+    pt_series = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(canon_segs.crs)
+    pt_geom = pt_series.iloc[0]
+
+    dists = canon_segs.geometry.distance(pt_geom)
+    min_idx = dists.idxmin()
+    min_dist = float(dists[min_idx])
+
+    if min_dist > click_tol:
+        return None
+
+    res_row = canon_segs.loc[min_idx].to_dict()
+    res_row['distance_m'] = min_dist
+    return res_row
+
+
+def top_priority_streets(time_input, n=20, data=None):
+    """Return top N priority canonical streets sorted by risk_score descending."""
+    df = get_snapshot(time_input, data=data)
+    canon = df[df['is_canonical'] == True].copy()
+    if 'risk_valid' in canon.columns:
+        canon = canon[canon['risk_valid'] == True]
+    canon.sort_values(by='risk_score', ascending=False, inplace=True)
+    return canon.head(n).copy()
+
+
+def class_counts(time_input, data=None):
+    """Return dictionary of risk class frequencies for canonical segments at time_input."""
+    df = get_snapshot(time_input, data=data)
+    canon = df[df['is_canonical'] == True].copy()
+    counts = canon['risk_class'].value_counts().to_dict()
+    for cls in ['LOW', 'MODERATE', 'HIGH', 'CRITICAL']:
+        counts.setdefault(cls, 0)
+    return counts
+
+
+def get_segment_detail(segment_id, time_input, data=None):
+    """
+    Get detail dictionary for a specific segment at time_input.
+    Returns drivers, explanation_text, facility distances, and provenance.
+    """
+    if data is None:
+        data = load_dashboard_data()
+
+    df = get_snapshot(time_input, data=data)
+    seg_rows = df[df['segment_id'] == segment_id]
+    if len(seg_rows) == 0:
+        return None
+
+    seg_record = seg_rows.iloc[0]
+
+    # Compute driver analysis
+    from src.explain_engine import compute_drivers, build_explanation_text
+    all_drivers = compute_drivers(df, config=data['config'])
+    driver_rec = next((d for d in all_drivers if d['segment_id'] == segment_id), None)
+
+    explanation = build_explanation_text(driver_rec, street_name=seg_record.get('name')) if driver_rec else ""
+
+    # Facility access info
+    cooling = data['cooling_access']
+    cool_rows = cooling[cooling['segment_id'] == segment_id]
+
+    dist_water = float(cool_rows['dist_water_m'].iloc[0]) if len(cool_rows) > 0 and 'dist_water_m' in cool_rows.columns else -1.0
+    dist_cooling = float(cool_rows['dist_cooling_m'].iloc[0]) if len(cool_rows) > 0 and 'dist_cooling_m' in cool_rows.columns else -1.0
+    covered_water = bool(cool_rows['covered_water'].iloc[0]) if len(cool_rows) > 0 and 'covered_water' in cool_rows.columns else False
+    covered_cooling = bool(cool_rows['covered_cooling'].iloc[0]) if len(cool_rows) > 0 and 'covered_cooling' in cool_rows.columns else False
+
+    provenance = {
+        'prov_status': seg_record.get('prov_status', 'MODELLED'),
+        'prov_obs_est': seg_record.get('prov_obs_est', ESTIMATED),
+        'estimated_flag': bool(seg_record.get('estimated_flag', True)),
+        'computation_mode': seg_record.get('computation_mode', data.get('mode', 'geometric')),
+        'assumptions_version': seg_record.get('prov_assumptions_version', data['config'].get('config_version', '1.3.0')),
+    }
+
+    return {
+        'segment_id': segment_id,
+        'street_name': seg_record.get('name', 'Unknown'),
+        'time': seg_record.get('time', str(time_input)),
+        'risk_score': float(seg_record.get('risk_score', 0.0)) if pd.notna(seg_record.get('risk_score')) else None,
+        'risk_class': seg_record.get('risk_class', 'LOW'),
+        'drivers': driver_rec['drivers'] if driver_rec else [],
+        'explanation_text': explanation,
+        'dist_water_m': dist_water,
+        'dist_cooling_m': dist_cooling,
+        'covered_water': covered_water,
+        'covered_cooling': covered_cooling,
+        'provenance': provenance,
+    }

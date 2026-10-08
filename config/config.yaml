@@ -90,6 +90,9 @@ access_penalty_weights:
   cooling: 0.4
   availability: 0.3
 max_access_penalty: 1.0
+explain:
+  # Minimum spread (max - min across canonical segments at the same time) required for a driver to be considered dominant
+  min_driver_spread: 0.05
 risk:
   normalization_scope: pooled_all_times
   normalization_clip_percentile: 99
@@ -114,3 +117,6 @@ feature_flags:
   use_ml_predictions: false
 data_source_metadata:
   osm_vintage: '2024'
+dashboard:
+  click_tolerance_m: 50.0
+
