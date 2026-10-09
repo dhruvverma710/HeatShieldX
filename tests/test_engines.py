@@ -464,9 +464,9 @@ class TestExplainEngine:
         dominant = [d for d in low_street['drivers'] if d['is_dominant']]
         assert len(dominant) == 0, f"LOW street should have no dominant drivers, got {[d['driver'] for d in dominant]}"
 
-        # Explanation text should say "no single dominant driver"
+        # Explanation text should say "no single factor stands out"
         text = build_explanation_text(low_street, "Quiet Lane")
-        assert "no single dominant driver" in text.lower(), f"Expected 'no single dominant driver' in: {text}"
+        assert "no single factor stands out" in text.lower(), f"Expected 'no single factor stands out' in: {text}"
 
     def test_low_street_wording_no_high_language(self):
         """LOW-risk streets should never have 'moderate', 'high', or 'poor' language next to printed percentile."""
@@ -475,13 +475,13 @@ class TestExplainEngine:
         drivers = compute_drivers(rdf)
         low_street = drivers[0]
 
-        # Test when LOW street has a dominant driver artificially
+        # LOW street with artificial HIGH driver should still not say 'high'
         low_street_dom = dict(low_street)
         low_street_dom['drivers'] = [
-            {'driver': 'sun exposure / low shade', 'value': 0.8, 'percentile': 0.8, 'level': 'HIGH', 'is_dominant': True}
+            {'driver': 'sun exposure / low shade', 'value': 0.8, 'percentile': 0.8, 'level': 'HIGH', 'is_dominant': False}
         ]
         text_dom = build_explanation_text(low_street_dom, "Quiet Lane")
-        assert "no single factor puts this street at high risk" in text_dom.lower()
+        assert "no single factor stands out" in text_dom.lower()
         assert "moderate" not in text_dom.lower()
         assert "poor" not in text_dom.lower()
 
@@ -489,7 +489,7 @@ class TestExplainEngine:
         text_lower = text_normal.lower()
         assert "moderate" not in text_lower
         assert "poor" not in text_lower
-        stripped = text_lower.replace('highest', '').replace('no single factor puts this street at high risk', '')
+        stripped = text_lower.replace('highest-ranking factor', '').replace('no single factor stands out', '')
         assert 'high' not in stripped, f"LOW street text should not contain 'high': {text_normal}"
 
     def test_explain_tie_guard(self):

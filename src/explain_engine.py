@@ -30,20 +30,22 @@ def _class_consistent_adjective(risk_class, driver_level):
     """
     Return a wording adjective consistent with the risk class.
     LOW-risk streets never get 'moderate', 'high', or 'poor' language.
+    Wording must never describe a driver as "low" when its level is HIGH.
     """
+    if driver_level == 'HIGH':
+        return 'high' if risk_class in ['HIGH', 'CRITICAL'] else 'elevated'
+        
     if risk_class == 'LOW':
         return 'low'
     elif risk_class == 'MODERATE':
         return {
             'LOW': 'low',
             'MODERATE': 'moderate',
-            'HIGH': 'elevated',
         }.get(driver_level, 'moderate')
     else:  # HIGH or CRITICAL
         return {
             'LOW': 'low',
             'MODERATE': 'moderate',
-            'HIGH': 'high',
         }.get(driver_level, 'high')
 
 
@@ -69,6 +71,9 @@ def compute_drivers(risk_df, config=None):
     threshold = config['risk']['driver_percentile_threshold']
     bands = config['risk']['driver_level_bands']
     min_spread = config.get('explain', {}).get('min_driver_spread', 0.05)
+    min_class_dominance = config.get('explain', {}).get('min_class_for_dominance', 'MODERATE')
+    class_order = {'LOW': 0, 'MODERATE': 1, 'HIGH': 2, 'CRITICAL': 3}
+    min_class_order = class_order.get(min_class_dominance, 1)
 
     # Group by time so percentiles are computed within same-time canonical segments
     times = risk_df['time'].unique() if 'time' in risk_df.columns else ['']
@@ -136,12 +141,15 @@ def compute_drivers(risk_df, config=None):
                     'cooling_access': cool_val,
                 }
 
+            risk_class = row.get('risk_class', 'LOW')
+            can_be_dominant = class_order.get(risk_class, 0) >= min_class_order
+
             driver_list = []
             for name, val in drivers.items():
                 pct = _percentile_rank(scope[name], val)
                 lvl = _level_from_percentile(pct, bands)
                 driver_spread = float(np.max(scope[name]) - np.min(scope[name])) if len(scope[name]) > 0 else 0.0
-                dominant = (pct >= threshold) and (driver_spread > min_spread)
+                dominant = can_be_dominant and (pct >= threshold) and (driver_spread > min_spread)
                 driver_list.append({
                     'driver': name,
                     'value': val,
@@ -187,27 +195,25 @@ def build_explanation_text(driver_record, street_name=None):
     text = f"At {time}, {label} has a risk score of {risk_score:.0f} ({risk_class})."
 
     if risk_class == 'LOW':
-        if dominant:
-            text += " No single factor puts this street at high risk."
-        else:
-            text += " No single dominant driver."
+        text += " No single factor stands out;"
+        if drivers:
+            top = drivers[0]
+            driver_title = top['driver'].replace('_', ' ')
+            text += f" the highest-ranking factor is {driver_title} (percentile {top['percentile']:.0%})."
     else:
         if dominant_names:
             text += f" Key drivers: {', '.join(dominant_names)}."
+            top = dominant[0]
+            adj = _class_consistent_adjective(risk_class, top['level'])
+            driver_title = top['driver'].replace('_', ' ').capitalize()
+            text += f" {driver_title} is {adj} (percentile {top['percentile']:.0%})."
         else:
             text += " No single dominant driver."
-
-    # Add class-consistent detail for the top driver
-    if dominant:
-        top = dominant[0]
-        adj = _class_consistent_adjective(risk_class, top['level'])
-        driver_title = top['driver'].replace('_', ' ').capitalize()
-        text += f" {driver_title} is {adj} (percentile {top['percentile']:.0%})."
-    elif drivers:
-        top = drivers[0]
-        adj = _class_consistent_adjective(risk_class, top['level'])
-        driver_title = top['driver'].replace('_', ' ')
-        text += f" The leading factor is {driver_title} ({adj}, percentile {top['percentile']:.0%})."
+            if drivers:
+                top = drivers[0]
+                adj = _class_consistent_adjective(risk_class, top['level'])
+                driver_title = top['driver'].replace('_', ' ')
+                text += f" The leading factor is {driver_title} ({adj}, percentile {top['percentile']:.0%})."
 
     return text
 

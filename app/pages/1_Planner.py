@@ -22,6 +22,8 @@ from src.dashboard_data import (
     compare_hottest_vs_highest_risk,
 )
 from src.cooling_engine import load_facilities
+from src.intervention_engine import generate_candidates
+from src.optimizer import run_optimizer
 
 st.set_page_config(page_title="Risk Planner - HeatShield X", page_icon="🗺️", layout="wide")
 
@@ -194,7 +196,7 @@ if map_output and map_output.get("last_clicked"):
         selected_segment_id = clicked_seg['segment_id']
 
 # ── 6. Tabs for Dashboard Panels ──
-tab_risk, tab_why, tab_hottest = st.tabs(["📊 Risk Overview", "🔍 WHY Panel (Detail)", "🔥 Why Not The Hottest?"])
+tab_risk, tab_why, tab_hottest, tab_opt = st.tabs(["📊 Risk Overview", "🔍 WHY Panel (Detail)", "🔥 Why Not The Hottest?", "⚙️ Optimization"])
 
 # ── Tab 1: Risk Overview ──
 with tab_risk:
@@ -343,3 +345,88 @@ with tab_hottest:
         st.write(f"- **Exposure Value**: {comp['highest_exposure']:.4f}")
         st.write(f"- **Vulnerability**: {comp['highest_vulnerability']:.4f}")
         st.write(f"- **Cooling Penalty**: {comp['highest_access_penalty']:.4f}")
+
+# ── Tab 4: Optimization ──
+with tab_opt:
+    st.subheader("⚙️ Resource Optimizer")
+    st.write("Allocate resources to automatically select the most impactful interventions.")
+    
+    col_w, col_c, col_s = st.columns(3)
+    counts = config.get('interventions', {}).get('default_counts', {'water': 2, 'cooling': 1, 'shade': 2})
+    max_counts = config.get('interventions', {}).get('max_counts', {'water': 10, 'cooling': 5, 'shade': 10})
+    
+    w_count = col_w.number_input("Water Points", min_value=0, max_value=max_counts.get('water', 10), value=counts.get('water', 2))
+    c_count = col_c.number_input("Cooling Centres", min_value=0, max_value=max_counts.get('cooling', 5), value=counts.get('cooling', 1))
+    s_count = col_s.number_input("Shade Interventions", min_value=0, max_value=max_counts.get('shade', 10), value=counts.get('shade', 2))
+    
+    if st.button("🚀 Optimize Interventions"):
+        with st.spinner("Running greedy optimizer..."):
+            # Build current state
+            scope_bounds_df = data['scope_bounds']
+            geo_row = scope_bounds_df[scope_bounds_df['mode'] == 'geometric']
+            if not geo_row.empty:
+                stored_bounds = (float(geo_row['scope_min'].iloc[0]), float(geo_row['scope_max'].iloc[0]))
+            else:
+                stored_bounds = (0, 100)
+
+            current_state = {
+                'exposure_results': data['exposure_records'],
+                'cooling_access': data['cooling_access'],
+                'risk_records': data['risk_records'],
+                'stored_bounds': stored_bounds,
+            }
+            
+            # Generate candidates
+            cands_df = generate_candidates(streets)
+            
+            # Run optimizer
+            limits = {'water': w_count, 'cooling': c_count, 'shade': s_count}
+            selected, next_state, meta = run_optimizer(cands_df, streets, data['vulnerability'], current_state, limits)
+            
+            st.session_state['opt_results'] = {
+                'selected': selected,
+                'meta': meta,
+            }
+            
+    if 'opt_results' in st.session_state:
+        res = st.session_state['opt_results']
+        selected = res['selected']
+        meta = res['meta']
+        
+        st.success(f"Optimization complete! Selected {len(selected)} interventions in {meta['runtime_s']:.2f}s.")
+        
+        if selected:
+            st.markdown("### Selected Interventions (Priority Table)")
+            sel_df = pd.DataFrame(selected)
+            disp_cols = [c for c in ['candidate_id', 'type', 'target_id', 'marginal_benefit', 'cumulative_benefit', 'prov_status'] if c in sel_df.columns]
+            st.dataframe(sel_df[disp_cols], use_container_width=True)
+            
+        st.markdown("### Modelled Impact")
+        st.caption("All values are modelled estimates. Labelled: **Modelled Impact**.")
+        
+        i_col1, i_col2 = st.columns(2)
+        i_col1.metric("Objective Before", f"{meta['objective_before']:.4f}")
+        i_col2.metric("Objective After", f"{meta['objective_after']:.4f}")
+        
+        if meta.get('early_stop_reason'):
+            st.info(f"Early stop: {meta['early_stop_reason']}")
+
+        # Draw Plotly before/after chart
+        fig_imp = go.Figure()
+        obj_b = meta['objective_before']
+        obj_a = meta['objective_after']
+        fig_imp.add_trace(go.Bar(
+            name='Before',
+            x=['Vuln-Weighted Exposure'],
+            y=[obj_b],
+            marker_color='lightslategrey'
+        ))
+        fig_imp.add_trace(go.Bar(
+            name='After',
+            x=['Vuln-Weighted Exposure'],
+            y=[obj_a],
+            marker_color='crimson'
+        ))
+        fig_imp.update_layout(barmode='group', title="Modelled Impact: Before vs After", yaxis_title="Vuln-Weighted Exposure")
+        st.plotly_chart(fig_imp, use_container_width=True)
+

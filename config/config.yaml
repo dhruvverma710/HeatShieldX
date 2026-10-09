@@ -1,5 +1,22 @@
-config_version: 1.3.0
+config_version: 2.1.0
 demo_area: Piedmont, California, USA
+
+routing:
+  walking_speed_mps: 1.3
+  max_detour_factor: 1.5
+  heat_aware_gamma_schedule: [8, 4, 2, 1]
+  balanced_alpha: 0.5
+  balanced_beta: 0.5
+  default_departure_time: "13:00"
+  od_snap_tolerance_m: 500
+  poi_tags:
+    amenity: ["cafe", "restaurant", "library", "community_centre", "drinking_water", "fountain", "shelter"]
+    leisure: ["park", "garden"]
+  max_stop_detour_m: 300
+  max_stops_shown: 8
+  stop_type_priority: ["water", "cooling", "shaded_public", "business"]
+  sponsored_stop_ids: []
+
 canonical_times:
 - 09:00
 - '11:00'
@@ -93,6 +110,8 @@ max_access_penalty: 1.0
 explain:
   # Minimum spread (max - min across canonical segments at the same time) required for a driver to be considered dominant
   min_driver_spread: 0.05
+  # Minimum risk class for any driver to be flagged dominant (LOW streets never have dominant drivers)
+  min_class_for_dominance: MODERATE
 risk:
   normalization_scope: pooled_all_times
   normalization_clip_percentile: 99
@@ -107,6 +126,30 @@ risk:
     HIGH:
     - 0.67
     - 1.0
+
+# ── Intervention & Optimizer (modelled prototype assumptions) ──
+interventions:
+  default_counts:
+    water: 2
+    cooling: 1
+    shade: 2
+  max_counts:
+    water: 10
+    cooling: 5
+    shade: 10
+  # null = use all graph nodes; set to an integer to prune candidates by top-k marginal benefit
+  candidate_pruning_top_k: null
+  objective_times: pooled_all_times
+  shade:
+    influence_length_m: 50
+    shade_gain: 0.5
+
+impact:
+  high_risk_classes:
+  - HIGH
+  - CRITICAL
+  optimizer_time_budget_s: 120
+
 intervention_effect_coefficients:
   tree_shade: 0.8
   cool_roof: 0.6
